@@ -16,20 +16,23 @@ workspace = true
 # Compile-time gate for OTLP support; disabled by default.
 # Downstream crates can enable via `features = ["otel"]`.
 default = []
-otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tonic"]
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tonic", "tracing-opentelemetry"]
 
 [dependencies]
 chrono = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-api = { workspace = true }
 codex-protocol = { workspace = true }
 eventsource-stream = { workspace = true }
-opentelemetry = { workspace = true, features = ["logs"], optional = true }
+opentelemetry = { workspace = true, features = ["logs", "trace"], optional = true }
+opentelemetry-appender-tracing = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = [
     "grpc-tonic",
     "http-proto",
     "http-json",
     "logs",
+    "trace",
     "reqwest-blocking-client",
     "reqwest-rustls",
     "tls",
@@ -39,6 +42,7 @@ opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = [
     "logs",
     "rt-tokio",
+    "trace",
 ], optional = true }
 http = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
@@ -52,3 +56,8 @@ tonic = { workspace = true, optional = true, features = [
     "tls-ring",
 ] }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

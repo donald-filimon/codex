@@ -1,11 +1,16 @@
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
+use codex_client::CodexHttpClient;
+pub use codex_client::CodexRequestBuilder;
+use http::HeaderMap;
+use http::HeaderName;
+use opentelemetry::global;
+use opentelemetry::propagation::Injector;
 use reqwest::header::HeaderValue;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-
-use codex_client::CodexHttpClient;
-pub use codex_client::CodexRequestBuilder;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Set this to add a suffix to the User-Agent string.
 ///
@@ -128,6 +133,19 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
     }
 }
 
+struct HeaderMapInjector<'a>(&'a mut HeaderMap);
+
+impl<'a> Injector for HeaderMapInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
 /// Create an HTTP client with default `originator` and `User-Agent` headers set.
 pub fn create_client() -> CodexHttpClient {
     let inner = build_reqwest_client();
@@ -141,15 +159,24 @@ pub fn build_reqwest_client() -> reqwest::Client {
     headers.insert("originator", originator().header_value.clone());
     let ua = get_codex_user_agent();
 
+    inject_trace_headers(&mut headers);
+
     let mut builder = reqwest::Client::builder()
         // Set UA via dedicated helper to avoid header validation pitfalls
         .user_agent(ua)
         .default_headers(headers);
+
     if is_sandboxed() {
         builder = builder.no_proxy();
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn inject_trace_headers(headers: &mut HeaderMap) {
+    global::get_text_map_propagator(|prop| {
+        prop.inject_context(&Span::current().context(), &mut HeaderMapInjector(headers));
+    });
 }
 
 fn is_sandboxed() -> bool {
@@ -160,6 +187,15 @@ fn is_sandboxed() -> bool {
 mod tests {
     use super::*;
     use core_test_support::skip_if_no_network;
+    use opentelemetry::propagation::Extractor;
+    use opentelemetry::propagation::TextMapPropagator;
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing::info_span;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     #[test]
     fn test_get_codex_user_agent() {
@@ -247,5 +283,44 @@ mod tests {
         )
         .unwrap();
         assert!(re.is_match(&user_agent));
+    }
+
+    #[test]
+    fn inject_trace_headers_uses_current_span_context() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("test-tracer");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _guard = subscriber.set_default();
+
+        let mut headers = HeaderMap::new();
+        let span = info_span!("client_request");
+        let _entered = span.enter();
+        let span_context = span.context().span().span_context().clone();
+
+        inject_trace_headers(&mut headers);
+
+        let extractor = HeaderMapExtractor(&headers);
+        let extracted = TraceContextPropagator::new().extract(&extractor);
+        let extracted_span = extracted.span();
+        let extracted_context = extracted_span.span_context();
+
+        assert!(extracted_context.is_valid());
+        pretty_assertions::assert_eq!(extracted_context.trace_id(), span_context.trace_id());
+        pretty_assertions::assert_eq!(extracted_context.span_id(), span_context.span_id());
+    }
+
+    struct HeaderMapExtractor<'a>(&'a HeaderMap);
+
+    impl<'a> Extractor for HeaderMapExtractor<'a> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).and_then(|value| value.to_str().ok())
+        }
+
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(HeaderName::as_str).collect()
+        }
     }
 }
