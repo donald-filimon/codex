@@ -38,6 +38,7 @@ use super::UnifiedExecResponse;
 use super::UnifiedExecSessionManager;
 use super::WARNING_UNIFIED_EXEC_SESSIONS;
 use super::WriteStdinRequest;
+use super::async_watcher::TRAILING_OUTPUT_GRACE;
 use super::async_watcher::emit_exec_end_for_unified_exec;
 use super::async_watcher::spawn_exit_watcher;
 use super::async_watcher::start_streaming_output;
@@ -172,6 +173,11 @@ impl UnifiedExecSessionManager {
         let chunk_id = generate_chunk_id();
         let process_id = request.process_id.clone();
         if has_exited {
+            // Short-lived commands can exit before the streaming task appends output,
+            // which leaves ExecCommandEnd with empty stdout and flakes snapshot tests.
+            let output_drained = session.output_drained_notify();
+            let _ = tokio::time::timeout(TRAILING_OUTPUT_GRACE, output_drained.notified()).await;
+
             // Short‑lived command: emit ExecCommandEnd immediately using the
             // same helper as the background watcher, so all end events share
             // one implementation.
