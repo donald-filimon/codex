@@ -27,6 +27,7 @@ use crate::responses::start_mock_server;
 use crate::wait_for_event;
 
 type ConfigMutator = dyn FnOnce(&mut Config) + Send;
+type PreBuildHook = dyn FnOnce(&Path) + Send;
 
 /// A collection of different ways the model can output an apply_patch call
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -49,6 +50,7 @@ pub enum ShellModelOutput {
 
 pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
+    pre_build_hooks: Vec<Box<PreBuildHook>>,
     auth: CodexAuth,
 }
 
@@ -69,8 +71,16 @@ impl TestCodexBuilder {
     pub fn with_model(self, model: &str) -> Self {
         let new_model = model.to_string();
         self.with_config(move |config| {
-            config.model = new_model.clone();
+            config.model = Some(new_model.clone());
         })
+    }
+
+    pub fn with_pre_build_hook<T>(mut self, hook: T) -> Self
+    where
+        T: FnOnce(&Path) + Send + 'static,
+    {
+        self.pre_build_hooks.push(Box::new(hook));
+        self
     }
 
     pub async fn build(&mut self, server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
@@ -93,6 +103,12 @@ impl TestCodexBuilder {
         home: Arc<TempDir>,
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
+        let mut hooks = vec![];
+        swap(&mut self.pre_build_hooks, &mut hooks);
+        for hook in hooks {
+            hook(home.path());
+        }
+
         let (config, cwd) = self.prepare_config(server, &home).await?;
 
         let auth = self.auth.clone();
@@ -169,6 +185,10 @@ pub struct TestCodex {
 }
 
 impl TestCodex {
+    pub fn codex_home_path(&self) -> &Path {
+        self.home.path()
+    }
+
     pub fn cwd_path(&self) -> &Path {
         self.cwd.path()
     }
@@ -358,6 +378,7 @@ fn function_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {
 pub fn test_codex() -> TestCodexBuilder {
     TestCodexBuilder {
         config_mutators: vec![],
+        pre_build_hooks: vec![],
         auth: CodexAuth::from_api_key("dummy"),
     }
 }
