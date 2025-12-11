@@ -38,7 +38,6 @@ use super::UnifiedExecResponse;
 use super::UnifiedExecSessionManager;
 use super::WARNING_UNIFIED_EXEC_SESSIONS;
 use super::WriteStdinRequest;
-use super::async_watcher::TRAILING_OUTPUT_GRACE;
 use super::async_watcher::emit_exec_end_for_unified_exec;
 use super::async_watcher::spawn_exit_watcher;
 use super::async_watcher::start_streaming_output;
@@ -142,15 +141,12 @@ impl UnifiedExecSessionManager {
         };
 
         let transcript = Arc::new(tokio::sync::Mutex::new(CommandTranscript::default()));
-        start_streaming_output(&session, context, Arc::clone(&transcript));
-
         let max_tokens = resolve_max_tokens(request.max_output_tokens);
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
 
         let start = Instant::now();
-        // For the initial exec_command call, we both stream output to events
-        // (via start_streaming_output above) and collect a snapshot here for
-        // the tool response body.
+        // For the initial exec_command call, collect a snapshot for the tool response
+        // body, then only start streaming output if the process stays alive.
         let OutputHandles {
             output_buffer,
             output_notify,
@@ -173,11 +169,6 @@ impl UnifiedExecSessionManager {
         let chunk_id = generate_chunk_id();
         let process_id = request.process_id.clone();
         if has_exited {
-            // Short-lived commands can exit before the streaming task appends output,
-            // which leaves ExecCommandEnd with empty stdout and flakes snapshot tests.
-            let output_drained = session.output_drained_notify();
-            let _ = tokio::time::timeout(TRAILING_OUTPUT_GRACE, output_drained.notified()).await;
-
             // Short‑lived command: emit ExecCommandEnd immediately using the
             // same helper as the background watcher, so all end events share
             // one implementation.
@@ -203,6 +194,9 @@ impl UnifiedExecSessionManager {
             // it, and register a background watcher that will emit
             // ExecCommandEnd when the PTY eventually exits (even if no further
             // tool calls are made).
+            // Early-exit commands should not emit ExecCommandOutputDelta events,
+            // so we only stream output once the session is confirmed alive.
+            start_streaming_output(&session, context, Arc::clone(&transcript));
             self.store_session(
                 Arc::clone(&session),
                 context,
@@ -546,20 +540,29 @@ impl UnifiedExecSessionManager {
                 }
             }
 
-            if drained_chunks.is_empty() {
-                exit_signal_received |= cancellation_token.is_cancelled();
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining == Duration::ZERO {
+        if drained_chunks.is_empty() {
+            exit_signal_received |= cancellation_token.is_cancelled();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining == Duration::ZERO {
+                break;
+            }
+
+            let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
+            if exit_signal_received && collected.is_empty() {
+                // A short-lived process can exit before the first stdout chunk is buffered.
+                // Keep waiting until the deadline so we still capture initial output.
+                if tokio::time::timeout(remaining, notified).await.is_err() {
                     break;
                 }
+                continue;
+            }
 
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                if exit_signal_received {
-                    let grace = remaining.min(POST_EXIT_OUTPUT_GRACE);
-                    if tokio::time::timeout(grace, notified).await.is_err() {
-                        break;
-                    }
-                    continue;
+            if exit_signal_received {
+                let grace = remaining.min(POST_EXIT_OUTPUT_GRACE);
+                if tokio::time::timeout(grace, notified).await.is_err() {
+                    break;
+                }
+                continue;
                 }
 
                 tokio::pin!(notified);
