@@ -525,6 +525,7 @@ impl UnifiedExecSessionManager {
         cancellation_token: &CancellationToken,
         deadline: Instant,
     ) -> Vec<u8> {
+        const INITIAL_OUTPUT_GRACE: Duration = Duration::from_millis(200);
         const POST_EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(50);
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
@@ -540,29 +541,26 @@ impl UnifiedExecSessionManager {
                 }
             }
 
-        if drained_chunks.is_empty() {
-            exit_signal_received |= cancellation_token.is_cancelled();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining == Duration::ZERO {
-                break;
-            }
-
-            let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-            if exit_signal_received && collected.is_empty() {
-                // A short-lived process can exit before the first stdout chunk is buffered.
-                // Keep waiting until the deadline so we still capture initial output.
-                if tokio::time::timeout(remaining, notified).await.is_err() {
+            if drained_chunks.is_empty() {
+                exit_signal_received |= cancellation_token.is_cancelled();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining == Duration::ZERO {
                     break;
                 }
-                continue;
-            }
 
-            if exit_signal_received {
-                let grace = remaining.min(POST_EXIT_OUTPUT_GRACE);
-                if tokio::time::timeout(grace, notified).await.is_err() {
-                    break;
-                }
-                continue;
+                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
+                if exit_signal_received {
+                    // Short-lived commands can exit before stdout is buffered. Wait briefly for
+                    // initial output, but avoid stalling turns when the command is silent.
+                    let grace = if collected.is_empty() {
+                        remaining.min(INITIAL_OUTPUT_GRACE)
+                    } else {
+                        remaining.min(POST_EXIT_OUTPUT_GRACE)
+                    };
+                    if tokio::time::timeout(grace, notified).await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
 
                 tokio::pin!(notified);
